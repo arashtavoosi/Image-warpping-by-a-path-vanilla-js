@@ -326,16 +326,133 @@ const WarpCanvas: React.FC = () => {
     }, []);
 
     useEffect(() => {
-        if (saveTrigger > 0) {
-            const canvas = canvasRef.current;
-            if (canvas) {
-                rendererRef.current.render(true);
-                const dataURL = canvas.toDataURL('image/png');
-                const link = document.createElement('a');
-                link.download = 'warped-image.png';
-                link.href = dataURL;
-                link.click();
+        if (saveTrigger === 0) return; // Do not run on initial mount
+
+        const renderer = rendererRef.current;
+        if (renderer.gl && renderer.render && renderer.imageResolution) {
+            const gl = renderer.gl;
+            const state = useWarpStore.getState();
+            const { controlPoints, heightScale, warpIntensity, pathOffset, imageLengthRatio } = state;
+
+            // 1. Calculate deformed geometry and its tight bounding box
+            const planeBuffers = renderer.buffers.plane;
+            if (!planeBuffers || !planeBuffers.originalPositions) {
+                console.error("Plane geometry not initialized. Cannot save.");
+                return;
             }
+            const originalPositions = planeBuffers.originalPositions;
+            const vertexCount = planeBuffers.vertexCount;
+            const curve = new CatmullRomCurve3(controlPoints);
+            
+            let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+
+            for (let i = 0; i < vertexCount; i++) {
+                const x = originalPositions[i * 3];
+                const y = originalPositions[i * 3 + 1];
+
+                const u = (x + 1) / 2;
+                const t = pathOffset + u * imageLengthRatio;
+                const clampedT = Math.max(0, Math.min(1, t));
+
+                const pointOnPath = curve.getPointAt(clampedT);
+                const tangent = curve.getTangentAt(clampedT);
+                const normal = new Vector3(-tangent.y, tangent.x, 0);
+                const offsetVector = normal.clone().multiplyScalar(y * warpIntensity);
+                const newPos = pointOnPath.clone().add(offsetVector);
+                
+                minX = Math.min(minX, newPos.x);
+                maxX = Math.max(maxX, newPos.x);
+                minY = Math.min(minY, newPos.y);
+                maxY = Math.max(maxY, newPos.y);
+            }
+            
+            const padding = Math.max(maxX - minX, maxY - minY) * 0.05; 
+            minX -= padding; maxX += padding; minY -= padding; maxY += padding;
+
+            const warpedWidth = maxX - minX;
+            const warpedHeight = maxY - minY;
+            const warpedAspectRatio = warpedWidth / warpedHeight;
+            
+            // 2. Determine output dimensions for high quality
+            const { width: imageWidth, height: imageHeight } = renderer.imageResolution;
+            const targetLongestSide = Math.max(imageWidth, imageHeight, 2048);
+            
+            let finalWidth, finalHeight;
+            if (warpedAspectRatio >= 1) {
+                finalWidth = targetLongestSide;
+                finalHeight = targetLongestSide / warpedAspectRatio;
+            } else {
+                finalHeight = targetLongestSide;
+                finalWidth = targetLongestSide * warpedAspectRatio;
+            }
+            const finalWidthInt = Math.round(finalWidth);
+            const finalHeightInt = Math.round(finalHeight);
+
+            // 3. Setup for offscreen rendering using a Framebuffer
+            const framebuffer = gl.createFramebuffer();
+            gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+
+            const targetTexture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, targetTexture);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, finalWidthInt, finalHeightInt, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, targetTexture, 0);
+            
+            // 4. Render the scene to the framebuffer
+            const originalViewport = gl.getParameter(gl.VIEWPORT);
+            gl.viewport(0, 0, finalWidthInt, finalHeightInt);
+            
+            const saveProjectionMatrix = createOrthographic(minX, maxX, minY, maxY, -10, 10);
+            
+            renderer.render({ 
+                force: true, 
+                saveMode: true,
+                overrideProjectionMatrix: saveProjectionMatrix,
+            });
+
+            // 5. Read pixel data from the framebuffer
+            const pixels = new Uint8Array(finalWidthInt * finalHeightInt * 4);
+            gl.readPixels(0, 0, finalWidthInt, finalHeightInt, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+            
+            // 6. Restore original WebGL state and clean up
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+            gl.viewport(originalViewport[0], originalViewport[1], originalViewport[2], originalViewport[3]);
+            gl.deleteFramebuffer(framebuffer);
+            gl.deleteTexture(targetTexture);
+
+            // 7. Convert pixels to a downloadable PNG
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = finalWidthInt;
+            tempCanvas.height = finalHeightInt;
+            const tempCtx = tempCanvas.getContext('2d');
+            if (tempCtx) {
+                const imageData = tempCtx.createImageData(finalWidthInt, finalHeightInt);
+                // Flip the image vertically
+                for (let y = 0; y < finalHeightInt; y++) {
+                    const srcY = y;
+                    const destY = finalHeightInt - 1 - y;
+                    const srcOffset = srcY * finalWidthInt * 4;
+                    const destOffset = destY * finalWidthInt * 4;
+                    const row = pixels.subarray(srcOffset, srcOffset + finalWidthInt * 4);
+                    imageData.data.set(row, destOffset);
+                }
+                tempCtx.putImageData(imageData, 0, 0);
+
+                tempCanvas.toBlob(blob => {
+                    if (blob) {
+                        const url = URL.createObjectURL(blob);
+                        const link = document.createElement('a');
+                        link.download = 'warped-image.png';
+                        link.href = url;
+                        link.click();
+                        URL.revokeObjectURL(url);
+                    }
+                }, 'image/png');
+            }
+        } else if (!renderer.imageResolution) {
+            alert("Please load an image before attempting to save.");
         }
     }, [saveTrigger]);
 
@@ -388,6 +505,7 @@ const WarpCanvas: React.FC = () => {
                 curve: {},
             },
             texture: null as WebGLTexture | null,
+            imageResolution: null as { width: number; height: number } | null,
             viewWidth: 0,
             viewHeight: 4,
             animationFrameId: 0,
@@ -423,7 +541,9 @@ const WarpCanvas: React.FC = () => {
         
         let lastState = { resolution: -1, heightScale: -1 };
 
-        const render = (force = false) => {
+        const render = (options: { force?: boolean, saveMode?: boolean, overrideProjectionMatrix?: Mat4 } = {}) => {
+            const { force = false, saveMode = false, overrideProjectionMatrix } = options;
+
             const state = useWarpStore.getState();
             const { resolution, heightScale } = state;
 
@@ -471,8 +591,8 @@ const WarpCanvas: React.FC = () => {
                 const pointOnPath = curve.getPointAt(clampedT);
                 const tangent = curve.getTangentAt(clampedT);
                 const normal = new Vector3(-tangent.y, tangent.x, 0);
-                const offsetVector = normal.multiplyScalar(y * warpIntensity);
-                const newPos = pointOnPath.add(offsetVector);
+                const offsetVector = normal.clone().multiplyScalar(y * warpIntensity);
+                const newPos = pointOnPath.clone().add(offsetVector);
 
                 deformedPositions[i * 3] = newPos.x;
                 deformedPositions[i * 3 + 1] = newPos.y;
@@ -497,24 +617,44 @@ const WarpCanvas: React.FC = () => {
             gl.bufferData(gl.ARRAY_BUFFER, curvePositions, gl.DYNAMIC_DRAW);
             renderer.buffers.curve.count = curvePoints.length;
 
-
-            gl.clearColor(0.11, 0.12, 0.13, 1.0);
+            if (saveMode) {
+                gl.clearColor(0.0, 0.0, 0.0, 0.0);
+            } else {
+                gl.clearColor(0.11, 0.12, 0.13, 1.0);
+            }
+            
             gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
             gl.enable(gl.DEPTH_TEST);
             gl.enable(gl.BLEND);
             gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-            const projMatrix = createOrthographic(-renderer.viewWidth / 2, renderer.viewWidth / 2, -renderer.viewHeight / 2, renderer.viewHeight / 2, -10, 10);
+            const projMatrix = overrideProjectionMatrix 
+                ? overrideProjectionMatrix 
+                : createOrthographic(-renderer.viewWidth / 2, renderer.viewWidth / 2, -renderer.viewHeight / 2, renderer.viewHeight / 2, -10, 10);
             
-            const simpleProgInfo = renderer.programs.simple;
-            gl.useProgram(simpleProgInfo.program);
-            gl.uniformMatrix4fv(simpleProgInfo.uniformLocations.projectionMatrix, false, projMatrix);
-            gl.uniform3f(simpleProgInfo.uniformLocations.modelPosition, 0, 0, 0);
-            gl.uniform4f(simpleProgInfo.uniformLocations.color, 1.0, 1.0, 1.0, 0.5);
-            gl.bindBuffer(gl.ARRAY_BUFFER, renderer.buffers.curve.position);
-            gl.vertexAttribPointer(simpleProgInfo.attribLocations.vertexPosition, 3, gl.FLOAT, false, 0, 0);
-            gl.enableVertexAttribArray(simpleProgInfo.attribLocations.vertexPosition);
-            gl.drawArrays(gl.LINE_STRIP, 0, renderer.buffers.curve.count);
+            if (!saveMode) {
+                const simpleProgInfo = renderer.programs.simple;
+                gl.useProgram(simpleProgInfo.program);
+                gl.uniformMatrix4fv(simpleProgInfo.uniformLocations.projectionMatrix, false, projMatrix);
+                gl.uniform3f(simpleProgInfo.uniformLocations.modelPosition, 0, 0, 0);
+                gl.uniform4f(simpleProgInfo.uniformLocations.color, 1.0, 1.0, 1.0, 0.5);
+                gl.bindBuffer(gl.ARRAY_BUFFER, renderer.buffers.curve.position);
+                gl.vertexAttribPointer(simpleProgInfo.attribLocations.vertexPosition, 3, gl.FLOAT, false, 0, 0);
+                gl.enableVertexAttribArray(simpleProgInfo.attribLocations.vertexPosition);
+                gl.drawArrays(gl.LINE_STRIP, 0, renderer.buffers.curve.count);
+                
+                gl.bindBuffer(gl.ARRAY_BUFFER, renderer.buffers.sphere.position);
+                gl.vertexAttribPointer(simpleProgInfo.attribLocations.vertexPosition, 3, gl.FLOAT, false, 0, 0);
+                gl.enableVertexAttribArray(simpleProgInfo.attribLocations.vertexPosition);
+                gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, renderer.buffers.sphere.indices);
+
+                controlPoints.forEach((p, i) => {
+                    const isDragged = renderer.dragState.isDragging && renderer.dragState.dragType === 'point' && renderer.dragState.pointIndex === i;
+                    gl.uniform3f(simpleProgInfo.uniformLocations.modelPosition, p.x, p.y, p.z);
+                    gl.uniform4f(simpleProgInfo.uniformLocations.color, isDragged ? 1.0 : 1.0, isDragged ? 0.41 : 1.0, isDragged ? 0.7 : 1.0, 0.8);
+                    gl.drawElements(gl.TRIANGLES, renderer.buffers.sphere.count, gl.UNSIGNED_SHORT, 0);
+                });
+            }
             
             if (renderer.texture) {
                 const planeProgInfo = renderer.programs.plane;
@@ -536,20 +676,8 @@ const WarpCanvas: React.FC = () => {
                 gl.drawElements(gl.TRIANGLES, planeBuffers.count, gl.UNSIGNED_SHORT, 0);
             }
             
-            gl.useProgram(simpleProgInfo.program);
-            gl.bindBuffer(gl.ARRAY_BUFFER, renderer.buffers.sphere.position);
-            gl.vertexAttribPointer(simpleProgInfo.attribLocations.vertexPosition, 3, gl.FLOAT, false, 0, 0);
-            gl.enableVertexAttribArray(simpleProgInfo.attribLocations.vertexPosition);
-            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, renderer.buffers.sphere.indices);
-
-            controlPoints.forEach((p, i) => {
-                const isDragged = renderer.dragState.isDragging && renderer.dragState.dragType === 'point' && renderer.dragState.pointIndex === i;
-                gl.uniform3f(simpleProgInfo.uniformLocations.modelPosition, p.x, p.y, p.z);
-                gl.uniform4f(simpleProgInfo.uniformLocations.color, isDragged ? 1.0 : 1.0, isDragged ? 0.41 : 1.0, isDragged ? 0.7 : 1.0, 0.8);
-                gl.drawElements(gl.TRIANGLES, renderer.buffers.sphere.count, gl.UNSIGNED_SHORT, 0);
-            });
             renderer.render = render;
-            if (!force) renderer.animationFrameId = requestAnimationFrame(() => render(false));
+            if (!force && !saveMode) renderer.animationFrameId = requestAnimationFrame(() => render({}));
         };
 
         const findClosestPointOnCurve = (curve: CatmullRomCurve3, worldPos: Vector3) => {
@@ -646,7 +774,7 @@ const WarpCanvas: React.FC = () => {
 
         const onPointerUp = (e: PointerEvent) => {
             rendererRef.current.dragState.isDragging = false;
-            rendererRef.current.dragState.dragType = null;
+            rendererRef.current.dragType = null;
             canvas.style.cursor = 'auto';
             canvas.releasePointerCapture(e.pointerId);
         };
@@ -659,7 +787,7 @@ const WarpCanvas: React.FC = () => {
                 canvas.height = Math.round(height * dpr);
                 gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
                 rendererRef.current.viewWidth = rendererRef.current.viewHeight * (width / height);
-                render(true);
+                render({ force: true });
             }
         });
 
@@ -667,6 +795,7 @@ const WarpCanvas: React.FC = () => {
             const image = new Image();
             image.crossOrigin = "anonymous";
             image.onload = () => {
+                rendererRef.current.imageResolution = { width: image.naturalWidth, height: image.naturalHeight };
                 const texture = gl.createTexture();
                 gl.bindTexture(gl.TEXTURE_2D, texture);
                 gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
@@ -675,7 +804,7 @@ const WarpCanvas: React.FC = () => {
                 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
                 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
                 rendererRef.current.texture = texture;
-                render(true);
+                render({ force: true });
             };
             image.src = url;
         };
