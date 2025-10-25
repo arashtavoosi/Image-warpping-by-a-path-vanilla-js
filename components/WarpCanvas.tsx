@@ -280,8 +280,9 @@ const planeVS = `
 const planeFS = `
     varying highp vec2 vTextureCoord;
     uniform sampler2D uSampler;
+    uniform highp vec2 uUvScale;
     void main() {
-        gl_FragColor = texture2D(uSampler, vTextureCoord);
+        gl_FragColor = texture2D(uSampler, vTextureCoord * uUvScale);
     }
 `;
 const simpleVS = `
@@ -485,6 +486,7 @@ const WarpCanvas: React.FC = () => {
                     uniformLocations: {
                         projectionMatrix: gl.getUniformLocation(planeProgram, 'uProjectionMatrix'),
                         uSampler: gl.getUniformLocation(planeProgram, 'uSampler'),
+                        uUvScale: gl.getUniformLocation(planeProgram, 'uUvScale'),
                     },
                 },
                 simple: {
@@ -506,6 +508,7 @@ const WarpCanvas: React.FC = () => {
             },
             texture: null as WebGLTexture | null,
             imageResolution: null as { width: number; height: number } | null,
+            uvScale: [1.0, 1.0],
             viewWidth: 0,
             viewHeight: 4,
             animationFrameId: 0,
@@ -660,6 +663,8 @@ const WarpCanvas: React.FC = () => {
                 const planeProgInfo = renderer.programs.plane;
                 gl.useProgram(planeProgInfo.program);
                 gl.uniformMatrix4fv(planeProgInfo.uniformLocations.projectionMatrix, false, projMatrix);
+                gl.uniform2f(planeProgInfo.uniformLocations.uUvScale, renderer.uvScale[0], renderer.uvScale[1]);
+
                 gl.activeTexture(gl.TEXTURE0);
                 gl.bindTexture(gl.TEXTURE_2D, renderer.texture);
                 gl.uniform1i(planeProgInfo.uniformLocations.uSampler, 0);
@@ -765,7 +770,7 @@ const WarpCanvas: React.FC = () => {
             } else if (renderer.dragState.dragType === 'plane' && renderer.dragState.curve) {
                 const moveVector = worldPos.clone().sub(renderer.dragState.startPoint);
                 const tangent = renderer.dragState.curve.getTangentAt(renderer.dragState.startT);
-                const distanceAlongCurve = moveVector.dot(tangent);
+                const distanceAlongCurve = moveVector.dot( tangent);
                 const deltaOffset = distanceAlongCurve / renderer.dragState.curveLength;
                 
                 useWarpStore.getState().setPathOffset(renderer.dragState.startOffset + deltaOffset);
@@ -793,16 +798,48 @@ const WarpCanvas: React.FC = () => {
 
         const loadImage = (url: string) => {
             const image = new Image();
-            image.crossOrigin = "anonymous";
+            if (!url.startsWith('data:')) {
+                image.crossOrigin = "anonymous";
+            }
             image.onload = () => {
                 rendererRef.current.imageResolution = { width: image.naturalWidth, height: image.naturalHeight };
                 const texture = gl.createTexture();
                 gl.bindTexture(gl.TEXTURE_2D, texture);
-                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+
+                const nextHighestPowerOfTwo = (x: number) => {
+                    --x;
+                    for (let i = 1; i < 32; i <<= 1) { x |= x >> i; }
+                    return x + 1;
+                };
+
+                // Create a power-of-two canvas to use as the texture source.
+                // This ensures mipmapping works for any image dimensions.
+                const potCanvas = document.createElement('canvas');
+                potCanvas.width = nextHighestPowerOfTwo(image.naturalWidth);
+                potCanvas.height = nextHighestPowerOfTwo(image.naturalHeight);
+                const ctx = potCanvas.getContext('2d');
+                if (!ctx) {
+                    console.error("Could not get 2D context for texture canvas");
+                    return;
+                }
+
+                ctx.drawImage(image, 0, 0, image.naturalWidth, image.naturalHeight);
+                
+                // Store the UV scale factor to only map to the image part of the canvas
+                rendererRef.current.uvScale = [
+                    image.naturalWidth / potCanvas.width,
+                    image.naturalHeight / potCanvas.height,
+                ];
+
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, potCanvas);
+                
+                // Since the source is now always POT, we can set wrapping and generate mipmaps.
                 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
                 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
                 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+                gl.generateMipmap(gl.TEXTURE_2D);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+
                 rendererRef.current.texture = texture;
                 render({ force: true });
             };
